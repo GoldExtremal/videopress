@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VideoPress</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-shape-1"></div>
+    <div class="bg-shape bg-shape-2"></div>
+
+    <main class="container">
+      <header class="hero">
+        <p class="badge">VideoPress</p>
+        <h1>Сжать видео</h1>
+        <p class="muted hero-text">Загружай даже очень большие файлы (10 ГБ+), отслеживай прогресс и скачивай оптимизированную версию.</p>
+      </header>
+
+      <section class="workspace">
+        <form id="uploadForm" class="card panel upload-panel">
+          <div class="field">
+            <label class="label" for="videoInput">Видео файл</label>
+            <label id="filePicker" class="file-picker" for="videoInput">
+              <span id="fileName" class="file-name">Файл не выбран</span>
+              <span id="fileAction" class="file-action">Выбрать файл</span>
+            </label>
+            <input id="videoInput" name="video" type="file" accept="video/*" required />
+          </div>
+
+          <div class="field">
+            <p class="label profile-label">Профиль сжатия</p>
+            <div class="radio-group" role="radiogroup" aria-label="Профиль сжатия">
+              <label class="radio-option">
+                <input type="radio" name="qualityPreset" value="high" />
+                <span>Минимальный размер</span>
+              </label>
+              <label class="radio-option">
+                <input type="radio" name="qualityPreset" value="medium" checked />
+                <span>Баланс качества и размера</span>
+              </label>
+              <label class="radio-option">
+                <input type="radio" name="qualityPreset" value="low" />
+                <span>Максимальное качество</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="cta-row">
+            <button id="startBtn" class="primary-btn" type="submit">Запустить сжатие</button>
+          </div>
+        </form>
+
+        <section id="statusCard" class="card panel status-panel">
+          <div id="statusPlaceholder" class="status-placeholder">
+            Здесь будет статус обработки видео...
+          </div>
+
+          <div id="statusContent" class="status-content hidden">
+            <div class="status-head">
+              <h2>Обработка файла</h2>
+              <p id="percentValue" class="percent">0%</p>
+            </div>
+
+            <div id="statusMiddle" class="status-middle">
+              <div class="status-line">
+                <p id="statusText" class="status-text">Ожидание...</p>
+                <p id="etaValue" class="eta hidden">~ 0с</p>
+              </div>
+
+              <div class="bar-wrap">
+                <div id="bar" class="bar"></div>
+              </div>
+
+              <p id="stats" class="muted"></p>
+            </div>
+
+            <div id="compressionFail" class="compression-fail hidden">
+              <div class="fail-icon" aria-hidden="true">✕</div>
+              <div class="fail-text">
+                <p class="fail-title">Не удалось сжать видео</p>
+                <p class="fail-subtitle">Размер файла после сжатия увеличился</p>
+              </div>
+            </div>
+
+            <div id="controlRow" class="control-row controls-hidden">
+              <button id="cancelBtn" class="control-btn danger" type="button"><img class="btn-icon" src="/icons/cancel.svg" alt="" />Отменить</button>
+              <button id="pauseBtn" class="control-btn pause" type="button"><img id="pauseIcon" class="btn-icon" src="/icons/pause.svg" alt="" />Пауза</button>
+            </div>
+
+            <a id="downloadLink" class="download download-hidden" href="#">⬇ Скачать сжатое видео</a>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/script.js"></script>
+  </body>
+</html>
