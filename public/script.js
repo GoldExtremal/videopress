@@ -172,7 +172,9 @@ async function pollJob(jobId) {
 
       const labelMap = {
         uploading: 'Загрузка файла на сервер...',
-        queued: 'Файл загружен. Подготовка к сжатию...',
+        queued: job.queuePosition > 0
+          ? `В очереди: ${job.queuePosition}-й. Сжатие начнётся, когда освободится сервер.`
+          : 'Файл загружен. Подготовка к сжатию...',
         compressing: 'Идет сжатие видео...',
         paused: 'Сжатие приостановлено.',
         done: 'Готово. Можно скачать сжатый файл.',
@@ -183,13 +185,15 @@ async function pollJob(jobId) {
 
       const isRunning = ['uploading', 'queued', 'compressing', 'paused'].includes(job.status);
       const isCompressionStage = ['compressing', 'paused'].includes(job.status);
+      // Waiting in the queue can be canceled too.
+      const canCancel = isCompressionStage || job.status === 'queued';
 
       setInputLock(isRunning);
       setPauseButtonState(Boolean(job.isPaused) || job.status === 'paused');
 
-      controlRow.classList.toggle('controls-hidden', !isCompressionStage);
+      controlRow.classList.toggle('controls-hidden', !canCancel);
       pauseBtn.disabled = !isCompressionStage;
-      cancelBtn.disabled = !isCompressionStage;
+      cancelBtn.disabled = !canCancel;
 
       if (job.status === 'compressing') {
         const etaSeconds = computeEta(job);
@@ -264,7 +268,11 @@ filePicker.addEventListener('click', (e) => {
   const hasFile = Boolean(fileInput.files && fileInput.files.length);
   if (hasFile) {
     e.preventDefault();
-    fetch('/api/outputs', { method: 'DELETE' }).catch((err) => console.error(err));
+    // Only this job's files: the results of others stay.
+    if (currentJobId) {
+      fetch(`/api/jobs/${currentJobId}`, { method: 'DELETE' }).catch((err) => console.error(err));
+      currentJobId = null;
+    }
     fileInput.value = '';
     fileName.textContent = 'Файл не выбран';
     hasStartedForCurrentFile = false;

@@ -9,10 +9,21 @@ const { spawn } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const OUTPUT_DIR = path.join(__dirname, 'outputs');
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const OUTPUT_DIR = path.join(DATA_DIR, 'outputs');
+
+const GB = 1024 * 1024 * 1024;
+// Limits for a small shared server: one compression at a time, files up to
+// MAX_UPLOAD_GB, results kept for TTL_HOURS, some disk always left free.
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_GB || 5) * GB;
+const MAX_PARALLEL = Math.max(1, Number(process.env.MAX_PARALLEL || 1));
+const TTL_MS = Number(process.env.TTL_HOURS || 24) * 3600 * 1000;
+const MIN_FREE_BYTES = Number(process.env.MIN_FREE_GB || 3) * GB;
 
 const jobs = new Map();
+const queue = [];
+let running = 0;
 
 for (const p of [UPLOAD_DIR, OUTPUT_DIR]) {
   fs.mkdirSync(p, { recursive: true });
@@ -30,6 +41,46 @@ function parseTimeToSeconds(value) {
   return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
+function touch(job) {
+  job.updatedAt = new Date().toISOString();
+}
+
+async function removeFile(p) {
+  if (!p) return;
+  try {
+    await fsp.unlink(p);
+  } catch (e) {
+    // ignore missing files
+  }
+}
+
+/** Start queued jobs while there is a free slot. */
+function runNext() {
+  while (running < MAX_PARALLEL && queue.length) {
+    const job = queue.shift();
+    if (job.status !== 'queued') continue;
+    running += 1;
+    startCompression(job);
+  }
+}
+
+/** A compression is over (done, failed or canceled): free its slot. */
+function finished(job) {
+  if (!job.slot) return;
+  job.slot = false;
+  running -= 1;
+  runNext();
+}
+
+function freeBytes() {
+  try {
+    const st = fs.statfsSync(DATA_DIR);
+    return st.bavail * st.bsize;
+  } catch (e) {
+    return Infinity;
+  }
+}
+
 function startCompression(job) {
   const { inputPath, outputPath, qualityPreset } = job;
   const presetMap = {
@@ -40,7 +91,8 @@ function startCompression(job) {
   const chosen = presetMap[qualityPreset] || presetMap.medium;
 
   job.status = 'compressing';
-  job.updatedAt = new Date().toISOString();
+  job.slot = true;
+  touch(job);
 
   const args = [
     '-y',
@@ -82,19 +134,24 @@ function startCompression(job) {
   ff.on('error', (err) => {
     job.status = 'error';
     job.error = `ffmpeg error: ${err.message}`;
-    job.updatedAt = new Date().toISOString();
+    touch(job);
+    finished(job);
   });
 
   ff.on('close', async (code) => {
+    job.ffmpegProcess = null;
+    finished(job);
     if (job.status === 'canceled') {
-      job.updatedAt = new Date().toISOString();
+      touch(job);
       return;
     }
 
     if (code !== 0) {
       job.status = 'error';
       job.error = `ffmpeg exited with code ${code}`;
-      job.updatedAt = new Date().toISOString();
+      touch(job);
+      await removeFile(job.inputPath);
+      await removeFile(job.outputPath);
       return;
     }
 
@@ -106,7 +163,9 @@ function startCompression(job) {
       job.resultSize = outStat.size;
       job.sourceSize = srcStat.size;
       job.savedPercent = srcStat.size > 0 ? Math.round((1 - outStat.size / srcStat.size) * 100) : 0;
-      job.updatedAt = new Date().toISOString();
+      touch(job);
+      // Only the result is downloaded: the source frees its disk space now.
+      await removeFile(inputPath);
     } catch (err) {
       job.status = 'error';
       job.error = `stat error: ${err.message}`;
@@ -142,15 +201,33 @@ function probeDuration(inputPath) {
 }
 
 app.post('/api/upload', (req, res) => {
-  const busboy = Busboy({
-    headers: req.headers,
-    limits: {
-      files: 1,
-      fileSize: 100 * 1024 * 1024 * 1024
-    }
-  });
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > MAX_UPLOAD_BYTES + 1024 * 1024) {
+    return res.status(413).json({ error: `Файл больше ${process.env.MAX_UPLOAD_GB || 5} ГБ` });
+  }
+  // The source and the result both need room, and the server some more.
+  if (freeBytes() < declared * 2 + MIN_FREE_BYTES) {
+    return res.status(507).json({ error: 'На сервере мало места, попробуйте позже' });
+  }
+
+  let busboy;
+  try {
+    busboy = Busboy({
+      headers: req.headers,
+      limits: {
+        files: 1,
+        fileSize: MAX_UPLOAD_BYTES
+      }
+    });
+  } catch (err) {
+    return res.status(400).json({ error: `Upload error: ${err.message}` });
+  }
 
   const jobId = randomUUID();
+  // Queued once both happened, in whatever order: the request is fully
+  // received, and the file is flushed to disk.
+  let uploaded = false;
+  let flushed = false;
   let fileHandled = false;
   let writeStream = null;
   let tempPath = null;
@@ -208,6 +285,19 @@ app.post('/api/upload', (req, res) => {
       }
     });
 
+    file.on('limit', () => {
+      const current = jobs.get(jobId);
+      if (current) {
+        current.status = 'error';
+        current.error = `Файл больше ${process.env.MAX_UPLOAD_GB || 5} ГБ`;
+        touch(current);
+      }
+      file.unpipe(writeStream);
+      writeStream.destroy();
+      removeFile(tempPath);
+      file.resume();
+    });
+
     file.pipe(writeStream);
 
     writeStream.on('error', () => {
@@ -215,19 +305,38 @@ app.post('/api/upload', (req, res) => {
       if (current) {
         current.status = 'error';
         current.error = 'Write stream error';
-        current.updatedAt = new Date().toISOString();
+        touch(current);
       }
+      removeFile(tempPath);
     });
 
-    writeStream.on('close', async () => {
-      const current = jobs.get(jobId);
-      if (!current || current.status === 'error') return;
-
-      current.status = 'queued';
-      current.updatedAt = new Date().toISOString();
-      current.durationSeconds = await probeDuration(current.inputPath);
-      startCompression(current);
+    writeStream.on('close', () => {
+      flushed = true;
+      enqueue();
     });
+  });
+
+  async function enqueue() {
+    const current = jobs.get(jobId);
+    if (!uploaded || !flushed || !current || current.status !== 'uploading') return;
+    current.durationSeconds = await probeDuration(current.inputPath);
+    if (current.status !== 'uploading') return;
+    current.status = 'queued';
+    touch(current);
+    queue.push(current);
+    runNext();
+  }
+
+  // The browser went away mid-upload: drop the half-written file.
+  req.on('aborted', () => {
+    if (uploaded) return;
+    const current = jobs.get(jobId);
+    if (current) {
+      current.status = 'canceled';
+      jobs.delete(jobId);
+    }
+    if (writeStream) writeStream.destroy();
+    removeFile(tempPath);
   });
 
   busboy.on('error', (err) => {
@@ -238,6 +347,13 @@ app.post('/api/upload', (req, res) => {
     if (!fileHandled || !tempPath) {
       return res.status(400).json({ error: 'No video file provided' });
     }
+    const current = jobs.get(jobId);
+    if (current && current.status === 'error') {
+      jobs.delete(jobId);
+      return res.status(413).json({ error: current.error });
+    }
+    uploaded = true;
+    enqueue();
     return res.json({ jobId });
   });
 
@@ -255,6 +371,7 @@ app.get('/api/jobs/:id', (req, res) => {
     fileName: job.fileName,
     qualityPreset: job.qualityPreset,
     status: job.status,
+    queuePosition: job.status === 'queued' ? queue.indexOf(job) + 1 : 0,
     isPaused: Boolean(job.isPaused),
     progress: job.progress,
     processedSeconds: job.processedSeconds,
@@ -322,42 +439,72 @@ app.delete('/api/jobs/:id', async (req, res) => {
     }
   }
 
+  if (job.status === 'paused') {
+    try {
+      process.kill(job.pid, 'SIGCONT');
+    } catch (e) {
+      // ignore
+    }
+  }
+
   job.status = 'canceled';
-  job.updatedAt = new Date().toISOString();
+  touch(job);
 
   jobs.delete(req.params.id);
+  const waiting = queue.indexOf(job);
+  if (waiting >= 0) queue.splice(waiting, 1);
 
-  const cleanup = [job.inputPath, job.outputPath].map(async (p) => {
-    if (!p) return;
-    try {
-      await fsp.unlink(p);
-    } catch (e) {
-      // ignore missing files
-    }
-  });
-
-  await Promise.all(cleanup);
+  await Promise.all([removeFile(job.inputPath), removeFile(job.outputPath)]);
   res.json({ ok: true });
 });
 
-app.delete('/api/outputs', async (_req, res) => {
-  try {
-    const entries = await fsp.readdir(OUTPUT_DIR, { withFileTypes: true });
-    const deletions = entries
-      .filter((entry) => entry.isFile())
-      .map((entry) => fsp.unlink(path.join(OUTPUT_DIR, entry.name)));
-
-    await Promise.all(deletions);
-    res.json({ ok: true, removed: deletions.length });
-  } catch (err) {
-    res.status(500).json({ error: `Failed to clear outputs: ${err.message}` });
+// Old jobs and stray files go after TTL_HOURS: the disk is shared.
+async function sweep() {
+  const now = Date.now();
+  for (const job of [...jobs.values()]) {
+    const busy = ['uploading', 'queued', 'compressing', 'paused'].includes(job.status);
+    if (busy || now - Date.parse(job.updatedAt) < TTL_MS) continue;
+    jobs.delete(job.id);
+    await Promise.all([removeFile(job.inputPath), removeFile(job.outputPath)]);
   }
-});
+  const known = new Set([...jobs.values()].flatMap((job) => [job.inputPath, job.outputPath]));
+  for (const dir of [UPLOAD_DIR, OUTPUT_DIR]) {
+    const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (!entry.isFile() || entry.name === '.gitkeep' || known.has(p)) continue;
+      const st = await fsp.stat(p).catch(() => null);
+      if (st && now - st.mtimeMs > TTL_MS) await removeFile(p);
+    }
+  }
+}
+setInterval(() => sweep().catch((err) => console.error('sweep failed', err)), 30 * 60 * 1000).unref();
+sweep().catch((err) => console.error('sweep failed', err));
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Video compressor is running: http://localhost:${PORT}`);
 });
+// Uploads of several gigabytes take long: no request timeout.
+server.requestTimeout = 0;
+
+// On shutdown (a redeploy) stop ffmpeg too, not to leave it running.
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.on(signal, () => {
+    for (const job of jobs.values()) {
+      if (job.ffmpegProcess) {
+        try {
+          if (job.isPaused) process.kill(job.pid, 'SIGCONT');
+          job.ffmpegProcess.kill('SIGTERM');
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  });
+}
