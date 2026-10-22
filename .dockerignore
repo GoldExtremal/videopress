@@ -1,0 +1,8 @@
+node_modules
+uploads
+outputs
+tests
+deploy
+.git
+.github
+*.md

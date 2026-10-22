@@ -1,0 +1,32 @@
+# VideoPress next to another app on a small server: behind that app's Caddy,
+# in its Docker network, with CPU and memory capped.
+# On the server: /opt/videopress/docker-compose.yml + .env (IMAGE_TAG, CADDY_NETWORK).
+services:
+  press:
+    image: ghcr.io/goldextremal/videopress:${IMAGE_TAG:-latest}
+    environment:
+      MAX_UPLOAD_GB: ${MAX_UPLOAD_GB:-5}
+      MAX_PARALLEL: "1"
+      TTL_HOURS: ${TTL_HOURS:-24}
+      MIN_FREE_GB: ${MIN_FREE_GB:-5}
+    volumes:
+      - press_data:/data
+    cpus: "1.0"
+    mem_limit: 1g
+    pids_limit: 256
+    restart: unless-stopped
+    networks:
+      - caddy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  caddy:
+    external: true
+    name: ${CADDY_NETWORK:?Set CADDY_NETWORK}
+
+volumes:
+  press_data:

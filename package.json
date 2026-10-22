@@ -5,7 +5,8 @@
   "description": "Web app for compressing large videos",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node tests/smoke.mjs"
   },
   "dependencies": {
     "busboy": "^1.6.0",

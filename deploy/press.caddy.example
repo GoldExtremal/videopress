@@ -1,0 +1,18 @@
+# Copy to the Caddy sites folder as press.caddy; the hash comes from
+#   docker run --rm caddy:2 caddy hash-password --plaintext '<password>'
+# and stays on the server only.
+press.{$APP_DOMAIN} {
+    basic_auth {
+        <login> <bcrypt-hash>
+    }
+    request_body {
+        max_size 5200MB
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "frame-ancestors 'none'"
+    }
+    reverse_proxy press:3000
+}
