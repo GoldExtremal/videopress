@@ -21,6 +21,22 @@ const MAX_PARALLEL = Math.max(1, Number(process.env.MAX_PARALLEL || 1));
 const TTL_MS = Number(process.env.TTL_HOURS || 24) * 3600 * 1000;
 const MIN_FREE_BYTES = Number(process.env.MIN_FREE_GB || 3) * GB;
 
+const PRESETS = {
+  high: { crf: '30', preset: 'veryfast' },
+  medium: { crf: '26', preset: 'faster' },
+  low: { crf: '22', preset: 'medium' },
+  // For a website: fits 1920x1080 (or 1080x1920 when vertical), never
+  // upscaled, bitrate peaks capped for streaming, no metadata (phones write
+  // GPS), plus a poster and a short silent preview loop. Slower x264 presets
+  // give smaller files.
+  web: { crf: '23', preset: process.env.WEB_X264_PRESET || 'medium', web: true }
+};
+// Fits a long x short box turned the video's way, sides kept even for x264.
+const fitBox = (long, short) =>
+  `scale='if(gt(iw,ih),min(${long},iw),min(${short},iw))':'if(gt(iw,ih),min(${short},ih),min(${long},ih))'` +
+  ':force_original_aspect_ratio=decrease:force_divisible_by=2';
+const PREVIEW_SECONDS = 4;
+
 const jobs = new Map();
 const queue = [];
 let running = 0;
@@ -81,96 +97,140 @@ function freeBytes() {
   }
 }
 
-function startCompression(job) {
+/** Every file a job may have on disk. */
+function jobFiles(job) {
+  return [job.inputPath, job.outputPath, job.posterPath, job.previewPath].filter(Boolean);
+}
+
+function compressArgs(job, chosen) {
+  const video = chosen.web
+    ? ['-vf', fitBox(1920, 1080), '-c:v', 'libx264', '-preset', chosen.preset, '-crf', chosen.crf,
+        '-maxrate', '6M', '-bufsize', '12M', '-profile:v', 'high', '-map_metadata', '-1', '-ac', '2']
+    : ['-c:v', 'libx264', '-preset', chosen.preset, '-crf', chosen.crf];
+  // 8-bit always: browsers do not play 10-bit H.264 that phones' HEVC turns into.
+  return ['-y', '-i', job.inputPath, ...video, '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', job.outputPath];
+}
+
+/** Run one ffmpeg as the job's current process; resolves with its exit code. */
+function runFfmpeg(job, args, trackProgress) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn('ffmpeg', args);
+    job.pid = ff.pid;
+    job.ffmpegProcess = ff;
+    job.isPaused = false;
+    if (job.status === 'paused') job.status = 'compressing';
+
+    ff.stderr.on('data', (chunk) => {
+      if (!trackProgress) return;
+      const text = chunk.toString();
+      const match = text.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/);
+      if (match && job.durationSeconds) {
+        const sec = parseTimeToSeconds(match[1]);
+        if (sec != null) {
+          job.processedSeconds = sec;
+          job.progress = Math.max(0, Math.min(99, Math.round((sec / job.durationSeconds) * 100)));
+          job.updatedAt = new Date().toISOString();
+        }
+      }
+    });
+
+    ff.on('error', (err) => reject(new Error(`ffmpeg error: ${err.message}`)));
+    ff.on('close', (code) => {
+      job.ffmpegProcess = null;
+      resolve(code);
+    });
+  });
+}
+
+/** Poster and preview loop, cut from the compressed video (small, so fast). */
+async function makeWebExtras(job) {
+  job.stage = 'extras';
+  touch(job);
+  job.media = await probeMedia(job.outputPath);
+  const duration = (job.media && job.media.duration) || job.durationSeconds || 0;
+
+  job.posterPath = path.join(OUTPUT_DIR, `${job.id}__poster.jpg`);
+  const posterAt = Math.min(1, duration / 3);
+  const posterCode = await runFfmpeg(job, ['-y', '-ss', String(posterAt), '-i', job.outputPath,
+    '-frames:v', '1', '-q:v', '3', job.posterPath]);
+  if (job.status === 'canceled') return;
+  if (posterCode !== 0) throw new Error(`poster: ffmpeg exited with code ${posterCode}`);
+
+  // Long videos often open on a title card: the loop starts a bit later.
+  job.previewPath = path.join(OUTPUT_DIR, `${job.id}__preview.mp4`);
+  const previewAt = duration > PREVIEW_SECONDS * 2 ? duration * 0.2 : 0;
+  const previewCode = await runFfmpeg(job, ['-y', '-ss', String(previewAt), '-t', String(PREVIEW_SECONDS),
+    '-i', job.outputPath, '-an', '-vf', fitBox(640, 360), '-c:v', 'libx264', '-preset', 'veryfast',
+    '-crf', '30', '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-movflags', '+faststart', job.previewPath]);
+  if (job.status === 'canceled') return;
+  if (previewCode !== 0) throw new Error(`preview: ffmpeg exited with code ${previewCode}`);
+}
+
+async function startCompression(job) {
   const { inputPath, outputPath, qualityPreset } = job;
-  const presetMap = {
-    high: { crf: '30', preset: 'veryfast' },
-    medium: { crf: '26', preset: 'faster' },
-    low: { crf: '22', preset: 'medium' }
-  };
-  const chosen = presetMap[qualityPreset] || presetMap.medium;
+  const chosen = PRESETS[qualityPreset] || PRESETS.medium;
 
   job.status = 'compressing';
   job.slot = true;
   touch(job);
 
-  const args = [
-    '-y',
-    '-i',
-    inputPath,
-    '-c:v',
-    'libx264',
-    '-preset',
-    chosen.preset,
-    '-crf',
-    chosen.crf,
-    '-c:a',
-    'aac',
-    '-b:a',
-    '128k',
-    '-movflags',
-    '+faststart',
-    outputPath
-  ];
+  try {
+    const code = await runFfmpeg(job, compressArgs(job, chosen), true);
+    if (job.status === 'canceled') return;
+    if (code !== 0) throw new Error(`ffmpeg exited with code ${code}`);
 
-  const ff = spawn('ffmpeg', args);
-  job.pid = ff.pid;
-  job.ffmpegProcess = ff;
-  job.isPaused = false;
-
-  ff.stderr.on('data', (chunk) => {
-    const text = chunk.toString();
-    const match = text.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/);
-    if (match && job.durationSeconds) {
-      const sec = parseTimeToSeconds(match[1]);
-      if (sec != null) {
-        job.processedSeconds = sec;
-        job.progress = Math.max(0, Math.min(99, Math.round((sec / job.durationSeconds) * 100)));
-        job.updatedAt = new Date().toISOString();
-      }
+    if (chosen.web) {
+      await makeWebExtras(job);
+      if (job.status === 'canceled') return;
     }
-  });
 
-  ff.on('error', (err) => {
-    job.status = 'error';
-    job.error = `ffmpeg error: ${err.message}`;
+    const [srcStat, outStat] = await Promise.all([fsp.stat(inputPath), fsp.stat(outputPath)]);
+    job.status = 'done';
+    job.progress = 100;
+    job.processedSeconds = job.durationSeconds || job.processedSeconds;
+    job.resultSize = outStat.size;
+    job.sourceSize = srcStat.size;
+    job.savedPercent = srcStat.size > 0 ? Math.round((1 - outStat.size / srcStat.size) * 100) : 0;
     touch(job);
-    finished(job);
-  });
-
-  ff.on('close', async (code) => {
+    // Only the result is downloaded: the source frees its disk space now.
+    await removeFile(inputPath);
+  } catch (err) {
+    if (job.status === 'canceled') return;
+    job.status = 'error';
+    job.error = err.message;
+    touch(job);
+    await Promise.all(jobFiles(job).map(removeFile));
+  } finally {
     job.ffmpegProcess = null;
     finished(job);
-    if (job.status === 'canceled') {
-      touch(job);
-      return;
-    }
+  }
+}
 
-    if (code !== 0) {
-      job.status = 'error';
-      job.error = `ffmpeg exited with code ${code}`;
-      touch(job);
-      await removeFile(job.inputPath);
-      await removeFile(job.outputPath);
-      return;
-    }
-
-    try {
-      const [srcStat, outStat] = await Promise.all([fsp.stat(inputPath), fsp.stat(outputPath)]);
-      job.status = 'done';
-      job.progress = 100;
-      job.processedSeconds = job.durationSeconds || job.processedSeconds;
-      job.resultSize = outStat.size;
-      job.sourceSize = srcStat.size;
-      job.savedPercent = srcStat.size > 0 ? Math.round((1 - outStat.size / srcStat.size) * 100) : 0;
-      touch(job);
-      // Only the result is downloaded: the source frees its disk space now.
-      await removeFile(inputPath);
-    } catch (err) {
-      job.status = 'error';
-      job.error = `stat error: ${err.message}`;
-      job.updatedAt = new Date().toISOString();
-    }
+/** Size and duration of a finished video, as a website lays it out. */
+function probeMedia(filePath) {
+  return new Promise((resolve) => {
+    const ffprobe = spawn('ffprobe', ['-v', 'error', '-show_entries',
+      'stream=codec_type,width,height:format=duration', '-of', 'json', filePath]);
+    let out = '';
+    ffprobe.stdout.on('data', (d) => {
+      out += d.toString();
+    });
+    ffprobe.on('close', () => {
+      try {
+        const info = JSON.parse(out);
+        const video = info.streams.find((s) => s.codec_type === 'video');
+        resolve({
+          width: video.width,
+          height: video.height,
+          duration: Number(Number(info.format.duration).toFixed(2)),
+          hasAudio: info.streams.some((s) => s.codec_type === 'audio')
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+    ffprobe.on('error', () => resolve(null));
   });
 }
 
@@ -236,7 +296,7 @@ app.post('/api/upload', (req, res) => {
 
   busboy.on('field', (name, val) => {
     if (name === 'qualityPreset') {
-      qualityPreset = ['high', 'medium', 'low'].includes(val) ? val : 'medium';
+      qualityPreset = Object.hasOwn(PRESETS, val) ? val : 'medium';
       const current = jobs.get(jobId);
       if (current && current.status === 'uploading') {
         current.qualityPreset = qualityPreset;
@@ -371,6 +431,7 @@ app.get('/api/jobs/:id', (req, res) => {
     fileName: job.fileName,
     qualityPreset: job.qualityPreset,
     status: job.status,
+    stage: job.stage || 'compress',
     queuePosition: job.status === 'queued' ? queue.indexOf(job) + 1 : 0,
     isPaused: Boolean(job.isPaused),
     progress: job.progress,
@@ -379,6 +440,8 @@ app.get('/api/jobs/:id', (req, res) => {
     sourceSize: job.sourceSize,
     resultSize: job.resultSize,
     savedPercent: job.savedPercent,
+    media: job.media || null,
+    extras: job.status === 'done' && job.posterPath ? ['poster', 'preview'] : [],
     error: job.error,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
@@ -392,6 +455,22 @@ app.get('/api/jobs/:id/download', (req, res) => {
 
   const downloadName = `${path.parse(job.fileName).name}_compressed.mp4`;
   res.download(job.outputPath, downloadName);
+});
+
+// The web profile's poster and preview loop.
+app.get('/api/jobs/:id/download/:extra', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'done') return res.status(409).json({ error: 'Result is not ready' });
+
+  const base = path.parse(job.fileName).name;
+  const extras = {
+    poster: [job.posterPath, `${base}_poster.jpg`],
+    preview: [job.previewPath, `${base}_preview.mp4`]
+  };
+  const [filePath, downloadName] = (Object.hasOwn(extras, req.params.extra) && extras[req.params.extra]) || [];
+  if (!filePath) return res.status(404).json({ error: 'No such file for this job' });
+  res.download(filePath, downloadName);
 });
 
 app.post('/api/jobs/:id/pause', (req, res) => {
@@ -454,7 +533,7 @@ app.delete('/api/jobs/:id', async (req, res) => {
   const waiting = queue.indexOf(job);
   if (waiting >= 0) queue.splice(waiting, 1);
 
-  await Promise.all([removeFile(job.inputPath), removeFile(job.outputPath)]);
+  await Promise.all(jobFiles(job).map(removeFile));
   res.json({ ok: true });
 });
 
@@ -465,9 +544,9 @@ async function sweep() {
     const busy = ['uploading', 'queued', 'compressing', 'paused'].includes(job.status);
     if (busy || now - Date.parse(job.updatedAt) < TTL_MS) continue;
     jobs.delete(job.id);
-    await Promise.all([removeFile(job.inputPath), removeFile(job.outputPath)]);
+    await Promise.all(jobFiles(job).map(removeFile));
   }
-  const known = new Set([...jobs.values()].flatMap((job) => [job.inputPath, job.outputPath]));
+  const known = new Set([...jobs.values()].flatMap(jobFiles));
   for (const dir of [UPLOAD_DIR, OUTPUT_DIR]) {
     const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
