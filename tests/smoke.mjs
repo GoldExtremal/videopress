@@ -12,11 +12,26 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const data = mkdtempSync(path.join(tmpdir(), 'videopress-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function video(name, seconds, size) {
+function video(name, seconds, size, pixFmt = 'yuv420p') {
   const file = path.join(data, name);
   const r = spawnSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `testsrc2=size=${size}:rate=30:duration=${seconds}`,
-    '-f', 'lavfi', '-i', `sine=duration=${seconds}`, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '10', '-shortest', '-y', file]);
+    '-f', 'lavfi', '-i', `sine=duration=${seconds}`, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '10',
+    '-pix_fmt', pixFmt, '-shortest', '-y', file]);
   assert.equal(r.status, 0, String(r.stderr));
+  return file;
+}
+
+function probe(file) {
+  const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries',
+    'stream=width,height,pix_fmt,codec_name', '-of', 'json', file]);
+  return JSON.parse(String(r.stdout)).streams[0];
+}
+
+async function save(url, name) {
+  const res = await fetch(url);
+  assert.equal(res.status, 200, url);
+  const file = path.join(data, name);
+  writeFileSync(file, Buffer.from(await res.arrayBuffer()));
   return file;
 }
 
@@ -107,6 +122,42 @@ try {
   await sleep(500);
   assert.deepEqual(readdirSync(path.join(data, 'uploads')), []);
   console.log('ok: an interrupted upload leaves nothing behind');
+
+  // Web profile: a 10-bit vertical phone video becomes 8-bit, 1080 wide,
+  // with a poster and a preview loop next to it.
+  const phone = video('phone.mp4', 4, '1440x2560', 'yuv420p10le');
+  const w = await upload(phone, 'web');
+  assert.equal(w.status, 200);
+  const doneW = await until(w.body.jobId, ['done', 'error']);
+  assert.equal(doneW.status, 'done', doneW.error);
+  assert.deepEqual(doneW.extras, ['poster', 'preview']);
+  assert.equal(doneW.media.width, 1080);
+  assert.equal(doneW.media.height, 1920);
+  assert.ok(doneW.media.hasAudio);
+  const main = probe(await save(`${BASE}/api/jobs/${w.body.jobId}/download`, 'w_main.mp4'));
+  assert.equal(main.pix_fmt, 'yuv420p');
+  const poster = probe(await save(`${BASE}/api/jobs/${w.body.jobId}/download/poster`, 'w_poster.jpg'));
+  assert.equal(poster.width, 1080);
+  const preview = probe(await save(`${BASE}/api/jobs/${w.body.jobId}/download/preview`, 'w_preview.mp4'));
+  assert.deepEqual([preview.width, preview.height, preview.pix_fmt], [360, 640, 'yuv420p']);
+  console.log('ok: web profile gives an 8-bit 1080p video, a poster and a preview');
+
+  // A small video is not upscaled.
+  const small = await upload(short, 'web');
+  const doneS = await until(small.body.jobId, ['done', 'error']);
+  assert.deepEqual([doneS.media.width, doneS.media.height], [640, 360]);
+  console.log('ok: web profile does not upscale');
+
+  // A cinema-wide frame fits 1920 across.
+  const wide = await upload(video('wide.mp4', 2, '2880x1080'), 'web');
+  const doneWide = await until(wide.body.jobId, ['done', 'error']);
+  assert.deepEqual([doneWide.media.width, doneWide.media.height], [1920, 720]);
+  console.log('ok: web profile fits a wide frame into 1920');
+
+  // Deleting a web job removes all three of its files.
+  await fetch(`${BASE}/api/jobs/${w.body.jobId}`, { method: 'DELETE' });
+  assert.equal(readdirSync(path.join(data, 'outputs')).filter((f) => f.startsWith(w.body.jobId)).length, 0);
+  console.log('ok: deleting a web job removes its poster and preview too');
 } finally {
   server.kill('SIGTERM');
 }

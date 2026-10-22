@@ -18,6 +18,9 @@ const pauseIcon = document.getElementById('pauseIcon');
 const cancelBtn = document.getElementById('cancelBtn');
 const controlRow = document.getElementById('controlRow');
 const startBtn = document.getElementById('startBtn');
+const extras = document.getElementById('extras');
+const posterLink = document.getElementById('posterLink');
+const previewLink = document.getElementById('previewLink');
 
 let estimateState = null;
 let currentJobId = null;
@@ -175,7 +178,7 @@ async function pollJob(jobId) {
         queued: job.queuePosition > 0
           ? `В очереди: ${job.queuePosition}-й. Сжатие начнётся, когда освободится сервер.`
           : 'Файл загружен. Подготовка к сжатию...',
-        compressing: 'Идет сжатие видео...',
+        compressing: job.stage === 'extras' ? 'Делаем постер и превью...' : 'Идет сжатие видео...',
         paused: 'Сжатие приостановлено.',
         done: 'Готово. Можно скачать сжатый файл.',
         error: `Ошибка: ${job.error || 'неизвестно'}`
@@ -223,6 +226,14 @@ async function pollJob(jobId) {
         }
         setCompressionFailMode(false);
         stats.textContent = `Исходный размер: ${src}. Сжатый: ${out}. Экономия: ${job.savedPercent || 0}%`;
+        if (job.media) {
+          stats.textContent += `. ${job.media.width}×${job.media.height}, ${formatDuration(job.media.duration)}`;
+        }
+        if (job.extras.length) {
+          posterLink.href = `/api/jobs/${jobId}/download/poster`;
+          previewLink.href = `/api/jobs/${jobId}/download/preview`;
+          extras.classList.remove('hidden');
+        }
       } else {
         setCompressionFailMode(false);
         stats.textContent = `Исходный размер: ${src}`;
@@ -305,6 +316,7 @@ form.addEventListener('submit', async (e) => {
   hasStartedForCurrentFile = true;
   renderStatusPanel();
   downloadLink.classList.add('download-hidden');
+  extras.classList.add('hidden');
   setCompressionFailMode(false);
   controlRow.classList.add('controls-hidden');
   etaValue.classList.add('hidden');

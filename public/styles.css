@@ -479,6 +479,17 @@ input[type='file'] { display: none; }
   text-decoration: none;
   filter: brightness(1.05);
 }
+.extras {
+  display: flex;
+  gap: 16px;
+  margin: 0;
+  font-weight: 700;
+}
+
+.extras a {
+  color: var(--accent);
+}
+
 .muted { color: var(--muted); }
 .hidden { display: none; }
 

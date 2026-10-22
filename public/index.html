@@ -47,6 +47,10 @@
                 <input type="radio" name="qualityPreset" value="low" />
                 <span>Максимальное качество</span>
               </label>
+              <label class="radio-option">
+                <input type="radio" name="qualityPreset" value="web" />
+                <span>Для сайта: 1080p, постер и превью</span>
+              </label>
             </div>
           </div>
 
@@ -77,6 +81,10 @@
               </div>
 
               <p id="stats" class="muted"></p>
+              <p id="extras" class="extras hidden">
+                <a id="posterLink" href="#">Постер</a>
+                <a id="previewLink" href="#">Превью</a>
+              </p>
             </div>
 
             <div id="compressionFail" class="compression-fail hidden">
